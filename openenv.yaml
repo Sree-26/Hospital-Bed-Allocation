@@ -1,0 +1,215 @@
+env_id: HospitalBedAllocation-v1
+version: "1.0.0"
+description: >
+  A real-world hospital bed allocation environment where an AI agent manages
+  patient intake, bed assignments, discharges, and transfers across multiple
+  hospital departments (ICU, General, Surgical, Pediatric, Emergency).
+  The agent must balance utilization efficiency against patient urgency,
+  handle mass-casualty surge events, and avoid allowing critical patients
+  to deteriorate while waiting for a bed.
+
+domain: healthcare / operations
+real_world_task: true
+
+authors:
+  - name: "OpenEnv Submission"
+
+# ── API ────────────────────────────────────────────────────────────────────
+api:
+  reset:
+    signature: "reset(seed=None) -> observation"
+    description: "Resets environment. Returns initial observation dict."
+  step:
+    signature: "step(action) -> (observation, reward, done, info)"
+    description: "Executes one action. Returns next obs, shaped reward in [-1,1], done flag, info dict."
+  state:
+    signature: "state() -> dict"
+    description: "Returns full internal state snapshot for graders and debugging."
+
+# ── ACTION SPACE ───────────────────────────────────────────────────────────
+action_space:
+  type: dict
+  fields:
+    action_type:
+      type: str
+      values: [admit, discharge, transfer, hold, mark_maintenance]
+      description: >
+        admit — assign a waiting patient to a free bed.
+        discharge — release a ready-for-discharge patient, freeing their bed.
+        transfer — move an admitted patient to a different compatible bed.
+        hold — no operation this step.
+        mark_maintenance — mark an empty bed as under maintenance (hard only).
+    patient_id:
+      type: str
+      description: "Target patient ID (required for admit, discharge, transfer)"
+      required_for: [admit, discharge, transfer]
+    bed_id:
+      type: str
+      description: "Target bed ID (required for admit, transfer, mark_maintenance)"
+      required_for: [admit, transfer, mark_maintenance]
+
+# ── OBSERVATION SPACE ──────────────────────────────────────────────────────
+observation_space:
+  type: dict
+  fields:
+    beds:
+      type: list[Bed]
+      description: "All beds in the hospital."
+      bed_fields:
+        bed_id: str
+        department: str  # ICU | GENERAL | SURGICAL | PEDIATRIC | EMERGENCY
+        occupied: bool
+        patient_id: str | null
+        maintenance: bool
+    waiting_queue:
+      type: list[Patient]
+      description: "Patients waiting for a bed assignment."
+      patient_fields:
+        patient_id: str
+        priority: int  # 1=CRITICAL, 2=URGENT, 3=STANDARD, 4=ELECTIVE
+        required_dept: str
+        arrival_step: int
+        length_of_stay: int
+        steps_waiting: int
+        status: str
+    admitted:
+      type: list[Patient]
+      description: "Currently admitted patients."
+    step:
+      type: int
+    max_steps:
+      type: int
+    utilization:
+      type: dict[str, float]
+      description: "Per-department bed utilization (0.0–1.0)."
+    surge_active:
+      type: bool
+      description: "True when a mass-casualty surge event is in progress."
+    task_level:
+      type: str
+      values: [easy, medium, hard]
+    info:
+      type: dict
+      fields:
+        total_patients_spawned: int
+        discharged_count: int
+        deteriorated_count: int
+
+# ── REWARD ─────────────────────────────────────────────────────────────────
+reward:
+  range: [-1.0, 1.0]
+  shape: continuous
+  partial_credit: true
+  components:
+    - name: admit_critical_urgent
+      value: +0.4 / +0.3
+      trigger: "Admitting a CRITICAL/URGENT patient"
+    - name: admit_standard_elective
+      value: +0.2 / +0.1
+      trigger: "Admitting a STANDARD/ELECTIVE patient"
+    - name: deterioration_penalty
+      value: -0.3
+      trigger: "Patient waited too long and deteriorated"
+    - name: discharge_bonus
+      value: +0.15
+      trigger: "Patient successfully discharged (frees bed)"
+    - name: critical_wait_penalty
+      value: -0.05 per step
+      trigger: "CRITICAL patient still in queue each step"
+    - name: utilization_bonus
+      value: +0.05
+      trigger: "Overall utilization in 70–90% sweet spot"
+    - name: invalid_action_penalty
+      value: -0.05 to -0.2
+      trigger: "Invalid bed assignment or maintenance abuse"
+
+# ── TASKS ──────────────────────────────────────────────────────────────────
+tasks:
+  - id: easy
+    description: >
+      30-step episode. Stable patient arrivals (~1.5/step). No surges.
+      No patient deterioration. Actions: admit, discharge, hold.
+    target_score: 0.50
+    max_score: 1.00
+    grader: EasyGrader
+    grader_weights:
+      discharge_rate: 0.40
+      no_deterioration: 0.40
+      utilization: 0.20
+
+  - id: medium
+    description: >
+      50-step episode. Higher arrivals (~2.5/step). Surge events (8% chance/step).
+      Patient deterioration enabled. Actions: + transfer.
+    target_score: 0.50
+    max_score: 1.00
+    grader: MediumGrader
+    grader_weights:
+      discharge_rate: 0.30
+      critical_urgency: 0.30
+      surge_response: 0.20
+      utilization: 0.20
+
+  - id: hard
+    description: >
+      80-step episode. High arrivals (~4/step). Frequent surges (15% chance/step).
+      Maintenance events. All actions available including mark_maintenance.
+    target_score: 0.50
+    max_score: 1.00
+    grader: HardGrader
+    grader_weights:
+      discharge_rate: 0.25
+      zero_critical_deterioration: 0.25
+      throughput_efficiency: 0.20
+      maintenance_management: 0.15
+      queue_depth_management: 0.15
+
+# ── HOSPITAL LAYOUT ────────────────────────────────────────────────────────
+hospital_layout:
+  total_beds: 56
+  departments:
+    - name: ICU
+      capacity: 8
+      overflow_allowed: false
+    - name: GENERAL
+      capacity: 20
+      overflow_allowed: true
+      overflow_targets: [EMERGENCY]
+    - name: SURGICAL
+      capacity: 12
+      overflow_allowed: false
+    - name: PEDIATRIC
+      capacity: 10
+      overflow_allowed: false
+    - name: EMERGENCY
+      capacity: 6
+      overflow_allowed: true
+      overflow_targets: [GENERAL]
+
+# ── DEPENDENCIES ───────────────────────────────────────────────────────────
+dependencies:
+  python: ">=3.9"
+  packages: []   # pure stdlib — no numpy/gym required
+
+# ── DOCKER ─────────────────────────────────────────────────────────────────
+docker:
+  image: "python:3.11-slim"
+  port: 7860
+  build_command: "docker build -t hospital-bed-env ."
+  run_command: "docker run -p 7860:7860 hospital-bed-env"
+
+# ── BASELINE SCORES ────────────────────────────────────────────────────────
+baseline_scores:
+  policy: "GreedyPolicy / SurgeAwarePolicy (rule-based)"
+  easy:
+    mean: 0.62
+    std: 0.04
+    seeds: [42, 123, 999, 2024, 7]
+  medium:
+    mean: 0.51
+    std: 0.06
+    seeds: [42, 123, 999, 2024, 7]
+  hard:
+    mean: 0.38
+    std: 0.08
+    seeds: [42, 123, 999, 2024, 7]
